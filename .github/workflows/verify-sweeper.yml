@@ -12,9 +12,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # immutable gate-ref: skipi-verify, контракт 2026-07-17.1
+  # immutable gate-ref: skipi-verify, контракт 2026-07-17.2
   # bump пина = коммит сюда ТОЛЬКО руками владельца (см. AGENTS.md)
-  VERIFY_SHA: b8fa6cb5058a8a9ec3c2b3ccca9ab12e4b5084aa
+  VERIFY_SHA: 20a4a1f5b8e15a0cd12ed0052ee256630a01066b
   BROKER_REPO: CaptTymur/skipi-broker
   APP_ID: '4323265'
   INSTALLATION_ID: '147185461'
