@@ -25,12 +25,32 @@ jobs:
     environment: emitter
     timeout-minutes: 15
     steps:
-      - name: Checkout pinned skipi-verify (immutable)
+      - name: Mint App installation token (key isolated here)
+        id: mint
+        env:
+          APP_KEY: ${{ secrets.VERIFY_EMITTER_APP_KEY }}
+        run: |
+          set -eu
+          b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          now="$(date +%s)"
+          header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64)"
+          payload="$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now-60))" "$((now+540))" "$APP_ID" | b64)"
+          sig="$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(printf '%s' "$APP_KEY") -binary | b64)"
+          inst_token="$(curl -sf -X POST -H "Authorization: Bearer $header.$payload.$sig" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+          echo "::add-mask::$inst_token"
+          echo "token=$inst_token" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pinned skipi-verify (immutable, private — App token)
+        env:
+          APP_TOKEN: ${{ steps.mint.outputs.token }}
         run: |
           set -eu
           git init -q verify
           git -C verify remote add origin https://github.com/CaptTymur/skipi-verify.git
-          git -C verify fetch -q --depth 1 origin "$VERIFY_SHA"
+          git -C verify -c credential.helper='!f(){ echo username=x-access-token; echo password=$APP_TOKEN; };f' fetch -q --depth 1 origin "$VERIFY_SHA"
           git -C verify checkout -q FETCH_HEAD
           test "$(git -C verify rev-parse HEAD)" = "$VERIFY_SHA"
 
@@ -64,22 +84,14 @@ jobs:
           done < prs.txt
           cat results.txt
 
-      - name: Post verify statuses (App token; isolated step)
+      - name: Post verify statuses (App token)
         env:
-          APP_KEY: ${{ secrets.VERIFY_EMITTER_APP_KEY }}
+          APP_TOKEN: ${{ steps.mint.outputs.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -eu
           [ -s results.txt ] || { echo "no open PRs — nothing to post"; exit 0; }
-          b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-          now="$(date +%s)"
-          header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64)"
-          payload="$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now-60))" "$((now+540))" "$APP_ID" | b64)"
-          sig="$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(printf '%s' "$APP_KEY") -binary | b64)"
-          inst_token="$(curl -sf -X POST -H "Authorization: Bearer $header.$payload.$sig" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+          inst_token="$APP_TOKEN"
           while read -r num sha state desc; do
             printf '{"state":"%s","context":"verify","description":"%s","target_url":"%s"}' \
               "$state" "$desc" "$RUN_URL" \
