@@ -1,0 +1,91 @@
+name: verify-sweeper
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: verify-sweeper
+  cancel-in-progress: false
+
+env:
+  # immutable gate-ref: skipi-verify, контракт 2026-07-17.1
+  # bump пина = коммит сюда ТОЛЬКО руками владельца (см. AGENTS.md)
+  VERIFY_SHA: b8fa6cb5058a8a9ec3c2b3ccca9ab12e4b5084aa
+  BROKER_REPO: CaptTymur/skipi-broker
+  APP_ID: '4323265'
+  INSTALLATION_ID: '147185461'
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    environment: emitter
+    timeout-minutes: 15
+    steps:
+      - name: Checkout pinned skipi-verify (immutable)
+        run: |
+          set -eu
+          git init -q verify
+          git -C verify remote add origin https://github.com/CaptTymur/skipi-verify.git
+          git -C verify fetch -q --depth 1 origin "$VERIFY_SHA"
+          git -C verify checkout -q FETCH_HEAD
+          test "$(git -C verify rev-parse HEAD)" = "$VERIFY_SHA"
+
+      - name: List open broker PRs (public read)
+        run: |
+          set -eu
+          curl -sf "https://api.github.com/repos/$BROKER_REPO/pulls?state=open&per_page=50" \
+            | python3 -c 'import json,sys; [print(p["number"]) for p in json.load(sys.stdin)]' > prs.txt
+          echo "open PRs:"; cat prs.txt
+
+      - name: Run pinned checker on each PR head (no PR code executed)
+        run: |
+          set -eu
+          : > results.txt
+          while read -r num; do
+            rm -rf broker
+            git init -q broker
+            git -C broker remote add origin "https://github.com/$BROKER_REPO.git"
+            git -C broker fetch -q --depth 1 origin "pull/$num/head"
+            git -C broker checkout -q FETCH_HEAD
+            head_sha="$(git -C broker rev-parse HEAD)"
+            if python3 verify/contract_check.py \
+                 --contract verify/contracts/platform-regression-contract.v1.json \
+                 --home skipi-broker --repo "skipi-broker=$PWD/broker" \
+                 > "check-$num.log" 2>&1; then
+              echo "$num $head_sha success contract PASS @ ${VERIFY_SHA:0:7}" >> results.txt
+            else
+              echo "$num $head_sha failure contract FAIL @ ${VERIFY_SHA:0:7}" >> results.txt
+            fi
+            echo "--- PR#$num ($head_sha):"; tail -5 "check-$num.log"
+          done < prs.txt
+          cat results.txt
+
+      - name: Post verify statuses (App token; isolated step)
+        env:
+          APP_KEY: ${{ secrets.VERIFY_EMITTER_APP_KEY }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          [ -s results.txt ] || { echo "no open PRs — nothing to post"; exit 0; }
+          b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          now="$(date +%s)"
+          header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64)"
+          payload="$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now-60))" "$((now+540))" "$APP_ID" | b64)"
+          sig="$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(printf '%s' "$APP_KEY") -binary | b64)"
+          inst_token="$(curl -sf -X POST -H "Authorization: Bearer $header.$payload.$sig" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+          while read -r num sha state desc; do
+            printf '{"state":"%s","context":"verify","description":"%s","target_url":"%s"}' \
+              "$state" "$desc" "$RUN_URL" \
+            | curl -sf -X POST -H "Authorization: Bearer $inst_token" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$BROKER_REPO/statuses/$sha" \
+                --data-binary @- > /dev/null
+            echo "posted verify=$state on PR#$num @$sha"
+          done < results.txt
