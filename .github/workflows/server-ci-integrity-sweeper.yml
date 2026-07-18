@@ -71,21 +71,10 @@ jobs:
           APP_TOKEN: ${{ steps.mint.outputs.token }}
         run: |
           set -eu
-          # TEMP DIAGNOSTIC (skipi-ops, owner-authorized 2026-07-18): capture HTTP code + safe body.message.
-          # Token is masked (::add-mask:: in mint step) and NEVER echoed; only the API response body is inspected.
-          # To be reverted to original bytes immediately after this single run.
-          http="$(curl -s -o body.json -w '%{http_code}' \
-            -H "Authorization: Bearer $APP_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$SERVER_REPO/pulls?state=open&base=$DELIVERY_BASE&per_page=50")"
-          echo "DIAG list-PRs HTTP=$http"
-          echo "DIAG body.message=$(python3 -c 'import json; d=json.load(open("body.json")); print(d.get("message","(no message)") if isinstance(d,dict) else "(json array len=%d)"%len(d))' 2>&1 || echo '(non-json body)')"
-          if [ "$http" = "200" ]; then
-            python3 -c 'import json; [print(p["number"]) for p in json.load(open("body.json"))]' > prs.txt
-            echo "open PRs (base=$DELIVERY_BASE):"; cat prs.txt
-          else
-            echo "DIAG: non-200 on skipi-server/pulls -> App token CANNOT read skipi-server PRs (see HTTP/message)"
-            exit 1
-          fi
+          curl -sf -H "Authorization: Bearer $APP_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$SERVER_REPO/pulls?state=open&base=$DELIVERY_BASE&per_page=50" \
+            | python3 -c 'import json,sys; [print(p["number"]) for p in json.load(sys.stdin)]' > prs.txt
+          echo "open PRs (base=$DELIVERY_BASE):"; cat prs.txt
 
       - name: Run pinned integrity checker on each PR head (no PR code executed)
         env:
