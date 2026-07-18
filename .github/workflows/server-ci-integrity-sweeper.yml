@@ -1,0 +1,120 @@
+name: server-ci-integrity-sweeper
+
+# READY-версия sweep-server.yml для ШАГА 3 (эмиттер-репо CaptTymur/skipi-verify-emitter).
+# Идентична drafts/sweep-server.yml, КРОМЕ SERVER_VERIFY_SHA — заполнен merge-SHA
+# контракт-PR #11 (шаг 2 исполнен 2026-07-18): immutable server gate-ref
+#   = d7f45264bf0ce816538b8acd17ba0cfabc7376b2  (skipi-verify main, контракт 2026-07-18.1)
+# INSTALLATION_ID/APP_ID/environment/секрет сверены с живым verify-sweeper.yml (совпали).
+# Коммит В ЭМИТТЕР — руки владельца/доверенная сессия (EXEC by design без write в эмиттер).
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: server-ci-integrity-sweeper
+  cancel-in-progress: false
+
+env:
+  # immutable server gate-ref (skipi-verify): контракт server-ci-integrity.v1
+  # bump пина = коммит сюда ТОЛЬКО руками владельца (см. AGENTS эмиттер-репо)
+  SERVER_VERIFY_SHA: d7f45264bf0ce816538b8acd17ba0cfabc7376b2
+  SERVER_REPO: CaptTymur/skipi-server
+  DELIVERY_BASE: master
+  APP_ID: '4323265'
+  INSTALLATION_ID: '147185461'   # сверено с живым verify-sweeper.yml (тот же App/аккаунт)
+  STATUS_CONTEXT: server-ci-integrity
+
+jobs:
+  sweep-server:
+    runs-on: ubuntu-latest
+    environment: emitter
+    timeout-minutes: 15
+    steps:
+      - name: Mint App installation token (key isolated here)
+        id: mint
+        env:
+          APP_KEY: ${{ secrets.VERIFY_EMITTER_APP_KEY }}
+        run: |
+          set -eu
+          b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          now="$(date +%s)"
+          header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64)"
+          payload="$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now-60))" "$((now+540))" "$APP_ID" | b64)"
+          sig="$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign <(printf '%s' "$APP_KEY") -binary | b64)"
+          jwt="$header.$payload.$sig"
+          resp="$(curl -s -w '\n%{http_code}' -X POST -H "Authorization: Bearer $jwt" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens")"
+          code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+          if [ "$code" != "201" ]; then echo "mint FAILED: HTTP $code"; echo "$body"; exit 1; fi
+          inst_token="$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+          echo "::add-mask::$inst_token"
+          echo "token=$inst_token" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pinned skipi-verify (immutable server gate-ref, App token)
+        env:
+          APP_TOKEN: ${{ steps.mint.outputs.token }}
+        run: |
+          set -eu
+          git init -q verify
+          git -C verify remote add origin https://github.com/CaptTymur/skipi-verify.git
+          git -C verify -c credential.helper='!f(){ echo username=x-access-token; echo password=$APP_TOKEN; };f' fetch -q --depth 1 origin "$SERVER_VERIFY_SHA"
+          git -C verify checkout -q FETCH_HEAD
+          test "$(git -C verify rev-parse HEAD)" = "$SERVER_VERIFY_SHA"
+
+      - name: List open skipi-server PRs targeting delivery base (App token)
+        env:
+          APP_TOKEN: ${{ steps.mint.outputs.token }}
+        run: |
+          set -eu
+          curl -sf -H "Authorization: Bearer $APP_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$SERVER_REPO/pulls?state=open&base=$DELIVERY_BASE&per_page=50" \
+            | python3 -c 'import json,sys; [print(p["number"]) for p in json.load(sys.stdin)]' > prs.txt
+          echo "open PRs (base=$DELIVERY_BASE):"; cat prs.txt
+
+      - name: Run pinned integrity checker on each PR head (no PR code executed)
+        env:
+          APP_TOKEN: ${{ steps.mint.outputs.token }}
+        run: |
+          set -eu
+          : > results.txt
+          while read -r num; do
+            [ -n "$num" ] || continue
+            rm -rf server
+            git init -q server
+            git -C server remote add origin "https://github.com/$SERVER_REPO.git"
+            git -C server -c credential.helper='!f(){ echo username=x-access-token; echo password=$APP_TOKEN; };f' fetch -q --depth 1 origin "pull/$num/head"
+            git -C server checkout -q FETCH_HEAD
+            head_sha="$(git -C server rev-parse HEAD)"
+            if python3 verify/server_ci_integrity_check.py \
+                 --repo "skipi-server=$PWD/server" \
+                 --manifest verify/contracts/server-ci-integrity.v1.json \
+                 > "check-$num.log" 2>&1; then
+              echo "$num $head_sha success server-ci-integrity PASS @ ${SERVER_VERIFY_SHA:0:7}" >> results.txt
+            else
+              echo "$num $head_sha failure server-ci-integrity FAIL @ ${SERVER_VERIFY_SHA:0:7}" >> results.txt
+            fi
+            echo "--- PR#$num ($head_sha):"; tail -5 "check-$num.log"
+          done < prs.txt
+          cat results.txt
+
+      - name: Post server-ci-integrity statuses (App token)
+        env:
+          APP_TOKEN: ${{ steps.mint.outputs.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          [ -s results.txt ] || { echo "no open master PRs — nothing to post"; exit 0; }
+          while read -r num sha state rest; do
+            printf '{"state":"%s","context":"%s","description":"%s","target_url":"%s"}' \
+              "$state" "$STATUS_CONTEXT" "$rest" "$RUN_URL" \
+            | curl -sf -X POST -H "Authorization: Bearer $APP_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$SERVER_REPO/statuses/$sha" \
+                --data-binary @- > /dev/null
+            echo "posted $STATUS_CONTEXT=$state on PR#$num @$sha"
+          done < results.txt
